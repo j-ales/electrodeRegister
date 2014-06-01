@@ -4,6 +4,9 @@ function [transformMtx, movedElec, movedHeadshape, maxError, movedElecLo, movedE
 %function [transformMtx, movedElec, movedHeadshape, maxError, movedElecLo, movedElecHi] = ... 
 %    registerElectrodesToScalp(scalp,fiducials,electrodes,[headshape])
 % 
+% This script does a 6 degree of freedom fit of electrodes to a scalp
+% surface. 
+%
 % All units expected to be in mm
 %
 % INPUTS:
@@ -29,6 +32,26 @@ function [transformMtx, movedElec, movedHeadshape, maxError, movedElecLo, movedE
 %                        fixed at their optimum values
 %
 %Depends on nearpoints from vistasoft: https://github.com/vistalab/vistasoft
+%Requires the statistics and optimization toolboxes from matlab
+
+% get all installed toolbox names
+v = ver;
+% collect the names in a cell array
+[installedToolboxes{1:length(v)}] = deal(v.Name);
+
+% check 
+tf = all(ismember('Optimization Toolbox',installedToolboxes));
+
+if tf ==false
+   error('This function requires the Optimization Toolbox, which is not installed') 
+end
+
+tf = all(ismember('Statistics Toolbox',installedToolboxes));
+
+if tf ==false
+   error('This function requires the Statistics Toolbox, which is not installed') 
+end
+
 
 %Set some options for the search
 optns = optimset(@lsqnonlin);
