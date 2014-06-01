@@ -20,7 +20,8 @@ This function solves this problem in two ways:
 Combined together this enables accurate electrode registration with the MRI.
 
 
+This function includes the nearpoints from vistasoft: https://github.com/vistalab/vistasoft
 
-
+This also requires the statistics and optimization toolboxes from matlab
 
 (c) Justin Ales, jma23@st-andrews.ac.uk
