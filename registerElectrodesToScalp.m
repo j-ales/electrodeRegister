@@ -1,24 +1,39 @@
-function [rotationMtx, movedElec, movedHeadshape, maxError, movedElecLo, movedElecHi] = registerElectrodesToScalp(scalp,elecFiducials,mriFiducials,electrodes,headshape)
+function [transformMtx, movedElec, movedHeadshape, maxError, movedElecLo, movedElecHi] = registerElectrodesToScalp(scalp,elecFiducials,mriFiducials,electrodes,headshape)
 
 %fitPointsToScalp  - Find a rigid transformation the best fits 2 sets of points
-%function [rotationMtx, movedPoints] = fitPointsToScalp(scalp,fiducials,electrodes,headshape)
+%function [transformMtx, movedElec, movedHeadshape, maxError, movedElecLo, movedElecHi] = ... 
+%    registerElectrodesToScalp(scalp,fiducials,electrodes,[headshape])
 % 
 % All units expected to be in mm
 %
-% scalp = face vertex scalp surface,
+% INPUTS:
+% scalp = Matlab structure with 2 fields: faces & vertices
 % fiducials = 3x3 set of fiducial
 % electrodes = nx3 electrode coordinates
+% optional:
 % headshape  = nx3 set of points taken from the scalp 
 %
-% rotationMtx - The best fit set of params used by rigidRotate()
+% OUTPUTS:
+% transformMtx  (4x4)  - The transformation matrix that transforms the electrode
+%                        coordinates to the scalp
+% movedElec     (nx3)  - The transformed electrodes
+% movedHeadshape (nx3) - The transformed headshape points
+% maxError    (scalar) - The maximum electrode distance error given 95% confidence
+%                        on the final fit.
+% movedElecLo (nx3x6)  -
+% movedElecHi (nx3x6)  - These two matrices contain the electrodes
+%                        transformed by parameters corresponding to the the range 
+%                        for the 95% confidence there are 6 parameters: 3 translations 
+%                        3 rotations. Each (nx3x1) points corresponds to
+%                        changing one paramter while holding the other parameters 
+%                        fixed at their optimum values
 %
+%Depends on nearpoints from vistasoft: https://github.com/vistalab/vistasoft
 
 %Set some options for the search
 optns = optimset(@lsqnonlin);
-optns = optimset(optns,'display', 'iter', 'maxfunevals', 1000, 'MaxIter', 100, ...
-    'LargeScale','on','TolX',1e-5,'TolFun',1e-5,'TypicalX',[0.05   0.05    0.05   0.1    0.1   0.1]);
-
-disp('fitpoints')
+optns = optimset(optns,'display', 'off', 'maxfunevals', 1000, 'MaxIter', 100,...
+    'FinDiffType','central','LargeScale','on','TolX',1e-7,'TolFun',1e-7);
 
 sf = 1/100; % Scale factor for making mm units similar to radians, this improves the nonlinear search
             % probably not needed in modern versions of matlab, but old
@@ -28,46 +43,40 @@ elecFiducials = elecFiducials*sf;
 mriFiducials = mriFiducials*sf;
 electrodes = electrodes*sf;
 
-
+%Checking to see if extra scalp points should be used in fitting
 if nargin<4 || isempty(headshape),
     headshape = [];
     movedHeadshape = [];
 end
 headshape = headshape*sf;
 
-
+%Find intitial registration using the known fiducial points.
 [tOrig rOrig] = alignFiducials(elecFiducials,mriFiducials);
 transOrig = [ rOrig, tOrig'; 0 0 0 1];
 transFid = transOrig*[elecFiducials, [1; 1; 1;]]';
 transFid = [transFid(1:3,:)]';
-
 t = tOrig;
 r = rOrig;
-
+%Transformation matrix
 trans = [ r, t'; 0 0 0 1];
     
-
-
 %Fiducials, electrodes and Headshape points translated to
 %initial conditions found above using just the mri and elec fiducials.
-% transFid = trans*[elecFiducials, [1; 1; 1;]]';
-% transFid = [transFid(1:3,:)]';
-% 
-% elecCoord = [electrodes ones(length(scf.x),1)];
-% transElec = trans*elecCoord';
-% electrodes = [transElec(1:3,:)]';
 electrodes = applyTransform(trans,electrodes);
 elecFiducials = applyTransform(trans,elecFiducials);
-
 initialTransform = trans;
 
             
-  %%%%%%%%%%%%%%%%%%%%%%xx          
-
+          
+% If there are scalp points apply the initial transform
 if ~isempty(headshape)
     headshape = applyTransform(trans,headshape);
     
+    %Do an intial QA check for scalp points that aren't close.
+    %Sometimes people pull the stylus off the scalp before discontinuing
+    %digitization
     [K,D] = nearpoints(headshape', stationaryPoints');
+    
     %throw out points farther than 3 cm from scalp
     npointsRem = sum(full(sqrt(D)>(30*sf)));
     disp([num2str(npointsRem) ' removed because they are further than 3 cm from inital scalp']); 
@@ -77,25 +86,36 @@ if ~isempty(headshape)
 end
 
 
-%Some mild constraints on the search space.
-lowlim = [ -100*sf -100*sf -100*sf -pi/2 -pi/2 -pi/2];
-uplim  = [  100*sf  100*sf  100*sf  pi/2  pi/2  pi/2];
 
-
-% This 
-% T = delaunay3(stationaryPoints(:,1),stationaryPoints(:,2),stationaryPoints(:,3))
-% initial = [initialTranslation 0 0 0];
-initial = [0 0 0 0 0 0];
 
 %This code is a quick way to calculate surface normals.
 %Surface normals are used to be able to calculate if electrodes are inside
 %the head.
+%
+scalpCenter = mean(scalp.vertices);
 fig = figure;
+
 N = get(patch('vertices',scalp.vertices,'faces',scalp.faces(:,[3 2 1])),'vertexnormals')';
-close(fig)
 N = N ./ repmat(sqrt(sum(N.^2)),3,1);
+signedDist = dot(  bsxfun(@minus,scalp.vertices,scalpCenter)', N);
+
+%We must also check that the structure given to us uses the appropriate
+%convention for the winding of faces.  We want positive surface normals to
+%point outwards. So we assume the midpoint of the scalp surface will be
+%more or less inside and check if most normals point away from the center.
+%
+if mean(sign(signedDist))<0 %Checking that more than 50% normals point in the "correct" directions
+    disp('Surface normals found with opposite assumed winding, flipping normals')
+    N = get(patch('vertices',scalp.vertices,'faces',scalp.faces(:,[1 2 3])),'vertexnormals')';
+    N = N ./ repmat(sqrt(sum(N.^2)),3,1);
+end
+    
 
 
+
+close(fig)
+
+initial = [0 0 0 0 0 0];
 
 %[params fval] = fminsearch(@translate,[0 0 0 0],optns,v1fMRI,VEP);
 %[params fval EXITFLAG, OUTPUT,LAMBDA,GRAD,HESSIAN] = fmincon(@rotcostfunc2,initial,[],[],[],[],lowlim,uplim,[],optns, ...
@@ -103,39 +123,54 @@ N = N ./ repmat(sqrt(sum(N.^2)),3,1);
 
 
 % %Constrained, uses large scale algorithm
+%Some mild constraints on the search space.
+% lowlim = [ -100*sf -100*sf -100*sf -pi/2 -pi/2 -pi/2];
+% uplim  = [  100*sf  100*sf  100*sf  pi/2  pi/2  pi/2];
 % [X,RESNORM,RESIDUAL,EXITFLAG,OUTPUT,LAMBDA,JACOBIAN] = lsqnonlin(@rotcostfunclsq,initial,lowlim,uplim,optns, ...
 % 						 stationaryPoints,electrodes,headshape,N);
 
-                     %Unconstrained uses line-search
+%Unconstrained uses line-search
+disp('Registering Electrodes.. . .   .       .');
 [X,RESNORM,RESIDUAL,EXITFLAG,OUTPUT,LAMBDA,JACOBIAN] = lsqnonlin(@rotcostfunclsq,initial,[],[],optns, ...
 						 stationaryPoints,electrodes,headshape,N);
-%
+disp('Registration Done');
 
 params = X;
 
 sigmaHat = RESNORM*length(RESIDUAL); %Sigma^2 estimator of measurement noise from data
 
+%Not used currently, but useful to know.  The following code will calculate
+%the covariance matrix for the parameter fits.
 covMat = sigmaHat*inv(JACOBIAN'*JACOBIAN); %Estimated Covariance Matrix;
-                     
+
+%Easy way is to use the matlab function nlparci to interpret to outputs of
+%lsqnonlin
+CI = nlparci(X,RESIDUAL,'jacobian',JACOBIAN);
+
+%Must undo the scaling used for the fitting procedure.
 if ~isempty(headshape)
     movedHeadshape = rigidRotate(params,headshape)./sf;
 end
 
 movedElec = rigidRotate(params,electrodes)./sf;
-
- 
 params(1:3) = params(1:3)./sf;
-rotationMtx = makeRotMtx(params);
 
-rotationMtx = rotationMtx*initialTransform;
+transformMtx = makeRotMtx(params);
 
-elec2plot = 1:size(electrodes,1);%
+%Total transform is the initial transform plus the final transform.
+transformMtx = transformMtx*initialTransform;
 
-CI = nlparci(X,RESIDUAL,'jacobian',JACOBIAN);
 
-nP=10;
-idx = 1;
-fig = gcf;
+%Know let's find how much we can shift electrodes and still have the cost 
+%be essentially the same. We're going to use the 95% confidence intervals
+%calculated above. We will change each parameter individual to the extreme
+%of the 95% ranges and see how much that moves the electrodes.
+%Then we'll take the largest movement over all electrodes and parameters
+%and call that our margin of error.
+%
+%Now, this ignores possible covariance between parameters, but it's a
+%fairly good metric of how well the cost function pins down the
+%registration.
 
 for iPar =1:length(CI),
     
